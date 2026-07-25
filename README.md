@@ -1,6 +1,6 @@
-# GPT-2 model trained on the Sprawl trilogy
+# Transformer model trained on the Sprawl trilogy
 
-* neuromancer-GPT because it borrows the architecture, obviously it is not a pre-trained one :D.
+* neuromancer-GPT because it borrows elements from the GPT-2 architecture, obviously it is not a pre-trained one :D.
 
 This is a pet project. I put this on Github only to showcase it. Everything here can pretty much be found in other sources, but maybe it is helpful for people starting out as there are just 2 files and it is easy to follow.
 
