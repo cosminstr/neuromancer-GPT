@@ -8,6 +8,4 @@ I trained the model on [Modal](https://modal.com/).
 
 Here is a 100 token paragraph the model generated. Unfortunately it didn't manage to finish its idea about the drones...
 
-```
 > it was a dark rainy afternoon, by the glow of the invisible casino. the thing was a kind of pilotless biplane of gossamer polymer, its wings silkscreened to resemble a giant butterfly. then it was gone, beyond the mesa's edge. he'd seen a wink of reflected neon off glass, either lenses or the turrets of lasers. the drones were part
-```
