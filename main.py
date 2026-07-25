@@ -1,4 +1,5 @@
 import math
+import modal
 from tqdm import tqdm
 import torch
 import torch.nn as nn
@@ -8,16 +9,6 @@ import torch.nn.functional as F
 
 from utils import generate_vocab, encode, decode
 
-torch.manual_seed(42)
-device = "cuda" if torch.cuda.is_available() else "cpu"
-print(f"Working on {device}")
-
-
-with open("sprawl.txt", "r") as f:
-    sprawl = f.read()
-
-sprawl_table, stoi, itos = generate_vocab(sprawl)
-
 
 class sprawlDataset(Dataset):
     def __init__(self, text, stoi):
@@ -25,21 +16,17 @@ class sprawlDataset(Dataset):
         self.encoded_text = torch.tensor(encode(text, stoi), dtype=torch.long)
 
     def __len__(self):
-        return len(self.encoded_text)
+        return len(self.encoded_text) - 512
 
     def __getitem__(self, idx):
-        return self.encoded_text[idx : idx + 128], self.encoded_text[
-            idx + 1 : idx + 129
+        return self.encoded_text[idx : idx + 512], self.encoded_text[
+            idx + 1 : idx + 513
         ]
-
-
-sprawl_dataset = sprawlDataset(sprawl, stoi)
-dataloader = DataLoader(sprawl_dataset, batch_size=32, drop_last=True)
 
 
 @dataclass
 class GPTConfig:
-    block_size: int = 128  # max sequence length (reduced for demo)
+    block_size: int = 512  # max sequence length
     vocab_size: int = 18413  # number of tokens in vocabulary
     n_layer: int = 12  # number of transformer blocks
     n_head: int = 12  # number of attention heads
@@ -150,8 +137,36 @@ class GPT(nn.Module):
         return logits, loss
 
 
-def train(model, loader, device, epochs):
-    model.train()
+app = modal.App("gpt-neuromancer")
+image = (
+    modal.Image.debian_slim()
+    .pip_install("torch", "tqdm")
+    .add_local_file("sprawl.txt", "/root/sprawl.txt", copy=True)
+    .add_local_python_source("utils")
+)
+checkpoint_volume = modal.Volume.from_name("gpt-neuromancer", create_if_missing=True)
+
+
+@app.function(
+    image=image,
+    gpu="L40S",
+    timeout=60 * 60 * 24,
+    volumes={"/checkpoints": checkpoint_volume},
+)
+def train(epochs):
+    torch.manual_seed(42)
+    device = torch.device("cuda")
+    print(f"Working on {device}")
+
+    with open("/root/sprawl.txt", "r") as f:
+        sprawl = f.read()
+
+    _, stoi, itos = generate_vocab(sprawl)
+    dataset = sprawlDataset(sprawl, stoi)
+    loader = DataLoader(dataset, batch_size=64, shuffle=True)
+
+    config = GPTConfig(vocab_size=len(stoi))
+    model = GPT(config).to(device)
     base_lr = 3e-4
     optimizer = torch.optim.AdamW(model.parameters(), lr=base_lr)
     total_steps = epochs * len(loader)
@@ -166,22 +181,42 @@ def train(model, loader, device, epochs):
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_schedule)
 
+    global_loss = float("inf")
     for epoch in range(epochs):
+        model.train()
         total_loss = 0
         for x, y in tqdm(loader):
             optimizer.zero_grad()
             x, y = x.to(device), y.to(device)
 
-            output, loss = model(x, y)
+            _, loss = model(x, y)
             total_loss += loss.item()
 
             loss.backward()
             optimizer.step()
             scheduler.step()
 
+        epoch_loss = total_loss / len(loader)
         print(
-            f"Loss at epoch {epoch}/{epochs} -> {total_loss / len(loader)} | lr={optimizer.param_groups[0]['lr']:.2e}"
+            f"Loss at epoch {epoch}/{epochs} -> {epoch_loss} | lr={optimizer.param_groups[0]['lr']:.2e}"
         )
+
+        if epoch_loss < global_loss:
+            torch.save(
+                {
+                    "model_state_dict": model.state_dict(),
+                    "config": config.__dict__,
+                    "stoi": stoi,
+                    "itos": itos,
+                    "epoch": epoch,
+                    "loss": epoch_loss,
+                },
+                "/checkpoints/neuromancer-gpt-1024.pth",
+            )
+            checkpoint_volume.commit()
+            global_loss = epoch_loss
+
+        sample_sprawl(model, 100, stoi, itos)
 
 
 def sanity_check(model, loader, device):
@@ -199,19 +234,18 @@ def sanity_check(model, loader, device):
     print(-torch.log(torch.tensor(1 / 18413)).item())
 
 
-def sample_sprawl(model, length):
+def sample_sprawl(model, length, stoi, itos):
     model.eval()
 
     tokens = torch.tensor(
         encode("It was a dark rainy afternoon,", stoi), dtype=torch.long
     )
-    tokens = tokens.to(device)
-    tokens.unsqueeze(0)
+    tokens = tokens.unsqueeze(0).to(next(model.parameters()).device)
 
     while tokens.size(1) < length:
         with torch.no_grad():
-            output = model(tokens)
-            logits = output[:, -1, :]
+            logits, _ = model(tokens)
+            logits = logits[:, -1, :]
             probs = F.softmax(logits, dim=-1)
 
             topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
@@ -219,16 +253,11 @@ def sample_sprawl(model, length):
             xcol = torch.gather(topk_indices, -1, ix)
             tokens = torch.cat((tokens, xcol), dim=1)
 
-    for i in range(length):
-        text = tokens[i, :length].tolist()
-        decoded_text = decode(text, itos)
-        print(">", decoded_text)
+    text = tokens[0, :length].tolist()
+    decoded_text = decode(text, itos)
+    print(">", decoded_text)
 
 
-net = GPT(GPTConfig)
-net = net.to(device)
-
-
-sanity_check(net, dataloader, device)
-train(net, dataloader, device, 10)
-sample_sprawl(net, 100)
+@app.local_entrypoint()
+def main():
+    train.remote(5)
