@@ -16,17 +16,17 @@ class sprawlDataset(Dataset):
         self.encoded_text = torch.tensor(encode(text, stoi), dtype=torch.long)
 
     def __len__(self):
-        return len(self.encoded_text) - 512
+        return len(self.encoded_text) - 128
 
     def __getitem__(self, idx):
-        return self.encoded_text[idx : idx + 512], self.encoded_text[
-            idx + 1 : idx + 513
+        return self.encoded_text[idx : idx + 128], self.encoded_text[
+            idx + 1 : idx + 129
         ]
 
 
 @dataclass
 class GPTConfig:
-    block_size: int = 512  # max sequence length
+    block_size: int = 128  # max sequence length
     vocab_size: int = 18413  # number of tokens in vocabulary
     n_layer: int = 12  # number of transformer blocks
     n_head: int = 12  # number of attention heads
@@ -112,6 +112,10 @@ class GPT(nn.Module):
         )
         #         self.lm_head = self.gpt.wte.weight
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+
+    def print_num_parameters(self):
+        total_parameters = sum(parameter.numel() for parameter in self.parameters())
+        print(f"Total number of parameters: {total_parameters:,}")
 
     def forward(self, x, targets=None):
         B, T = x.size()
@@ -211,7 +215,7 @@ def train(epochs):
                     "epoch": epoch,
                     "loss": epoch_loss,
                 },
-                "/checkpoints/neuromancer-gpt-1024.pth",
+                "/checkpoints/neuromancer-gpt-128.pth",
             )
             checkpoint_volume.commit()
             global_loss = epoch_loss
@@ -238,7 +242,7 @@ def sample_sprawl(model, length, stoi, itos):
     model.eval()
 
     tokens = torch.tensor(
-        encode("It was a dark rainy afternoon,", stoi), dtype=torch.long
+        encode("He was now inside the matrix, the grid,", stoi), dtype=torch.long
     )
     tokens = tokens.unsqueeze(0).to(next(model.parameters()).device)
 
