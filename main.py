@@ -5,9 +5,28 @@ import torch
 import torch.nn as nn
 from dataclasses import dataclass
 from torch.utils.data import Dataset, DataLoader
+from typing import Literal
 import torch.nn.functional as F
 
 from utils import generate_vocab, encode, decode
+
+global_config = {
+    "checkpoint_name": "neuromancer-lightweight-128.pth",
+    "gpt-2": {  # this was trained on the original sprawl-only corpus.
+        "block_size": 128,
+        "vocab_size": 18413,  # 25497 for corpus.txt
+        "n_layer": 12,
+        "n_head": 12,
+        "n_embd": 768,
+    },
+    "lightweight": {
+        "block_size": 256,
+        "vocab_size": 25497,
+        "n_layer": 4,
+        "n_head": 2,
+        "n_embd": 64,
+    },
+}
 
 
 class sprawlDataset(Dataset):
@@ -26,11 +45,15 @@ class sprawlDataset(Dataset):
 
 @dataclass
 class GPTConfig:
-    block_size: int = 128  # max sequence length
-    vocab_size: int = 18413  # number of tokens in vocabulary
-    n_layer: int = 12  # number of transformer blocks
-    n_head: int = 12  # number of attention heads
-    n_embd: int = 768  # embedding dimension
+    block_size: int = global_config["lightweight"]["block_size"]  # max sequence length
+    vocab_size: int = global_config["lightweight"][
+        "vocab_size"
+    ]  # number of tokens in vocabulary
+    n_layer: int = global_config["lightweight"][
+        "n_layer"
+    ]  # number of transformer blocks
+    n_head: int = global_config["lightweight"]["n_head"]  # number of attention heads
+    n_embd: int = global_config["lightweight"]["n_embd"]  # embedding dimension
 
 
 class CausalSelfAttention(nn.Module):
@@ -145,7 +168,7 @@ app = modal.App("gpt-neuromancer")
 image = (
     modal.Image.debian_slim()
     .pip_install("torch", "tqdm")
-    .add_local_file("sprawl.txt", "/root/sprawl.txt", copy=True)
+    .add_local_file("corpus.txt", "/root/corpus.txt", copy=True)
     .add_local_python_source("utils")
 )
 checkpoint_volume = modal.Volume.from_name("gpt-neuromancer", create_if_missing=True)
@@ -157,12 +180,12 @@ checkpoint_volume = modal.Volume.from_name("gpt-neuromancer", create_if_missing=
     timeout=60 * 60 * 24,
     volumes={"/checkpoints": checkpoint_volume},
 )
-def train(epochs):
+def train(epochs, corpus):
     torch.manual_seed(42)
     device = torch.device("cuda")
     print(f"Working on {device}")
 
-    with open("/root/sprawl.txt", "r") as f:
+    with open(f"/root/{corpus}.txt", "r") as f:
         sprawl = f.read()
 
     _, stoi, itos = generate_vocab(sprawl)
@@ -215,7 +238,7 @@ def train(epochs):
                     "epoch": epoch,
                     "loss": epoch_loss,
                 },
-                "/checkpoints/neuromancer-gpt-128.pth",
+                f"/checkpoints/{global_config['checkpoint_name']}",
             )
             checkpoint_volume.commit()
             global_loss = epoch_loss
@@ -263,5 +286,14 @@ def sample_sprawl(model, length, stoi, itos):
 
 
 @app.local_entrypoint()
-def main():
-    train.remote(5)
+def main(print_params=False, corpus: Literal["sprawl", "corpus"] = "corpus"):
+    if print_params:
+        with open(f"{corpus}.txt", "r") as f:
+            sprawl = f.read()
+        _, stoi, _ = generate_vocab(sprawl)
+
+        config = GPTConfig(vocab_size=len(stoi))
+        model = GPT(config)
+        model.print_num_parameters()
+    else:
+        train.remote(5, corpus)

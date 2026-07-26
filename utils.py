@@ -19,7 +19,7 @@ def generate_vocab(text):
         key=lambda word: word[1], reverse=True
     )  # order in descending order based on the number of apparitions
 
-    # print(f"vocabulary size is {len(freq_table)}")
+    print(f"vocabulary size is {len(freq_table) + 1}")
     freq_table = [("<pad>", 0)] + freq_table
 
     stoi = {word: i for i, (word, count) in enumerate(freq_table)}
@@ -58,7 +58,7 @@ def decode(code, itos):
 
 
 if __name__ == "__main__":
-    with open("sprawl.txt", "r") as f:
+    with open("corpus.txt", "r") as f:
         sprawl = f.read()
 
     table, stoi, itos = generate_vocab(sprawl)
