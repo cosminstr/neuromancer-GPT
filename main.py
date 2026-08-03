@@ -30,16 +30,17 @@ global_config = {
 
 
 class sprawlDataset(Dataset):
-    def __init__(self, text, stoi):
+    def __init__(self, text, stoi, block_size=256):
         super().__init__()
         self.encoded_text = torch.tensor(encode(text, stoi), dtype=torch.long)
+        self.context_window = block_size
 
     def __len__(self):
-        return len(self.encoded_text) - 128
+        return len(self.encoded_text) - self.context_window
 
     def __getitem__(self, idx):
-        return self.encoded_text[idx : idx + 128], self.encoded_text[
-            idx + 1 : idx + 129
+        return self.encoded_text[idx : idx + self.context_window], self.encoded_text[
+            idx + 1 : idx + self.context_window + 1
         ]
 
 
@@ -169,6 +170,7 @@ image = (
     modal.Image.debian_slim()
     .pip_install("torch", "tqdm")
     .add_local_file("corpus.txt", "/root/corpus.txt", copy=True)
+    .add_local_file("sprawl.txt", "/root/sprawl.txt", copy=True)
     .add_local_python_source("utils")
 )
 checkpoint_volume = modal.Volume.from_name("gpt-neuromancer", create_if_missing=True)

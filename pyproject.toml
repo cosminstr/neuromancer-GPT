@@ -4,6 +4,11 @@ version = "0.1.0"
 requires-python = ">=3.13"
 dependencies = [
     "modal>=1.5.3",
+    "openai-harmony>=0.0.8",
+    "python-dotenv>=1.2.2",
+    "tiktoken>=0.13.0",
     "torch>=2.13.0",
     "tqdm>=4.69.1",
+    "transformers>=5.14.1",
+    "wandb>=0.28.1",
 ]
