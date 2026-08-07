@@ -1,17 +1,19 @@
+import math
 import os
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
+
 from dotenv import load_dotenv
 import modal
-import wandb
-from tqdm import tqdm
 import torch
-import math
-from torch.utils.data import Dataset, DataLoader
-from main import GPT
-from transformers import AutoModelForCausalLM, AutoTokenizer
-from dataclasses import dataclass
-from typing import Literal
 import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset
+from tqdm import tqdm
+from transformers import AutoModelForCausalLM, AutoTokenizer
+import wandb
+
+from main import GPT
 
 load_dotenv(Path(__file__).parent / ".env")
 
@@ -48,6 +50,15 @@ class sprawlDataset(Dataset):
         ]
 
 
+@dataclass
+class GPTConfig:
+    block_size: int = 256
+    vocab_size: int = 201088
+    n_layer: int = 4
+    n_head: int = 2
+    n_embd: int = 64
+
+
 class DistillationLoss(torch.nn.Module):
     def __init__(self, temperature=2):
         super().__init__()
@@ -75,66 +86,40 @@ class DistillationLoss(torch.nn.Module):
 
 
 def build_gpt_input(tokens, tokenizer):
-    """Apply harmony template to the paragraphs from sprawl.txt for gpt-oss usage"""
-    text_batch = tokenizer.batch_decode(tokens, skip_special_tokens=True)
-    system_prompt = "You are a teacher model for a distillation task. Your job is to create 'soft targets' to train the student model. For a given sequence, create minimum 512 additional tokens. This is William Gibson-like fiction. Keep the style consistent."
-    messages = []
+    """Place the original tokens in a teacher-forced Harmony assistant response."""
+    source_marker = "<|teacher_source_tokens|>"
+    messages = [
+        {
+            "role": "system",
+            "content": "Write internally consistent William Gibson-like cyberpunk fiction.",
+        },
+        {"role": "user", "content": "Write a passage of fiction."},
+        {"role": "assistant", "content": source_marker},
+    ]
+    formatted_message = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=False,
+        reasoning_effort="low",
+    )
+    prefix, marker, _ = formatted_message.partition(source_marker)
+    if not marker:
+        raise RuntimeError("Could not locate source marker in formatted teacher input")
 
-    for text in text_batch:
-        messages.append(
-            [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": text},
-            ]
-        )
+    prefix_ids = tokenizer.encode(prefix, add_special_tokens=False)
+    prefix_tokens = torch.tensor(prefix_ids, dtype=tokens.dtype).unsqueeze(0)
+    prefix_tokens = prefix_tokens.expand(tokens.size(0), -1)
+    input_ids = torch.cat((prefix_tokens, tokens), dim=1)
 
-    formatted_messages = []
-
-    for m in messages:
-        formatted_messages.append(
-            tokenizer.apply_chat_template(
-                m,
-                tokenize=False,
-                add_generation_prompt=True,
-                reasoning_effort="low",
-            )
-        )
-
-    inputs = tokenizer(
-        formatted_messages,
-        return_tensors="pt",
-        padding=True,
-    )  # not on device
-
-    return inputs
+    return {
+        "input_ids": input_ids,
+        "attention_mask": torch.ones_like(input_ids),
+    }, len(prefix_ids)
 
 
-def extract_source_logits(input_ids, logits, source_tokens):
-    """Return logits at the formatted input positions matching source_tokens."""
-    outputs = []
-
-    for batch_index, token_tensor in enumerate(input_ids):
-        token_ids = token_tensor.tolist()
-        source_ids = source_tokens[batch_index].tolist()
-        source_start = next(
-            (
-                index
-                for index in range(len(token_ids) - len(source_ids), -1, -1)
-                if token_ids[index : index + len(source_ids)] == source_ids
-            ),
-            None,
-        )
-        if source_start is None:
-            raise RuntimeError(
-                "Could not locate source tokens in formatted teacher input"
-            )
-
-        # The logit at each source position predicts the following source token.
-        outputs.append(
-            logits[batch_index, source_start : source_start + len(source_ids) - 1]
-        )
-
-    return torch.stack(outputs)
+def extract_source_logits(logits, source_start, source_length):
+    """Return next-token logits produced at each original source position."""
+    return logits[:, source_start : source_start + source_length]
 
 
 app = modal.App("gpt-neuromancer-distillation")
@@ -147,14 +132,19 @@ image = (
         "tiktoken",
         "openai-harmony",
         "accelerate",
-        "kernels>=0.12.0",
+        "kernels>=0.12.0,<0.16.0",
         "bitsandbytes>=0.46.1",
         "wandb",
         "python-dotenv",
     )
     .add_local_file("corpus.txt", "/root/corpus.txt", copy=True)
     .add_local_file("sprawl.txt", "/root/sprawl.txt", copy=True)
-    .env({"WANDB_API_KEY": os.environ["WANDB_API_KEY"]})
+    .env(
+        {
+            "WANDB_API_KEY": os.environ["WANDB_API_KEY"],
+            "HF_TOKEN": os.environ["HF_TOKEN"],
+        }
+    )
     .add_local_python_source("utils")
     .add_local_python_source("main")
 )
@@ -164,59 +154,31 @@ hf_volume = modal.Volume.from_name("hf")
 
 @app.function(
     image=image,
-    gpu="h100:2",
+    gpu="H100",
     timeout=60 * 60 * 24,
     volumes={"/checkpoints": checkpoint_volume, "/hf": hf_volume},
 )
-def distill(epochs, text):
+def distill(epochs, text, checkpoint_name, wandb_run_name, wandb_entity_name):
     set_seed()
 
     tokenizer = AutoTokenizer.from_pretrained(
         "/hf/openai/gpt-oss-20b", local_files_only=True
     )
     tokenizer.padding_side = "left"
-    teacher_device = torch.device("cuda:0")
-    student_device = torch.device("cuda:1")
+    device = torch.device("cuda:0")
     teacher = AutoModelForCausalLM.from_pretrained(
         "/hf/openai/gpt-oss-20b",
-        device_map={"": teacher_device},
+        device_map={"": device},
         torch_dtype="auto",
         local_files_only=True,
     )
     teacher.eval()
 
-    global_config = {
-        "checkpoint_name": "neuromancer-distilled-256-init.pth",
-        "lightweight": {
-            "block_size": 256,
-            "vocab_size": teacher.get_output_embeddings().out_features,
-            "n_layer": 4,
-            "n_head": 2,
-            "n_embd": 64,
-        },
-    }
-
     wandb_run = wandb.init(
-        entity="personal-cosmin", project="neuromancer-GPT", name="distillation-1"
+        entity=wandb_entity_name, project="neuromancer-GPT", name=wandb_run_name
     )
 
-    @dataclass
-    class GPTConfig:
-        block_size: int = global_config["lightweight"][
-            "block_size"
-        ]  # max sequence length
-        vocab_size: int = global_config["lightweight"][
-            "vocab_size"
-        ]  # number of tokens in vocabulary
-        n_layer: int = global_config["lightweight"][
-            "n_layer"
-        ]  # number of transformer blocks
-        n_head: int = global_config["lightweight"][
-            "n_head"
-        ]  # number of attention heads
-        n_embd: int = global_config["lightweight"]["n_embd"]  # embedding dimension
-
-    print(f"Teacher on {teacher_device}; student on {student_device}")
+    print(f"Teacher on {device}; student on {device}")
 
     with open(f"/root/{text}.txt") as f:
         text = f.read()
@@ -224,8 +186,8 @@ def distill(epochs, text):
     dataset = sprawlDataset(text, tokenizer)
     loader = DataLoader(dataset, batch_size=32, shuffle=True)
 
-    config = GPTConfig()
-    student = GPT(config).to(student_device)
+    config = GPTConfig(vocab_size=teacher.get_output_embeddings().out_features)
+    student = GPT(config).to(device)
     base_lr = 3e-4
     optimizer = torch.optim.AdamW(student.parameters(), lr=base_lr)
     criterion = DistillationLoss()
@@ -249,16 +211,16 @@ def distill(epochs, text):
         for x, y in tqdm(loader):
             steps += 1
             optimizer.zero_grad()
-            teacher_source = torch.cat((x, y[:, -1:]), dim=1)
-            gpt_input = build_gpt_input(teacher_source, tokenizer).to(teacher_device)
-            x, y = x.to(student_device), y.to(student_device)
+            gpt_input, source_start = build_gpt_input(x, tokenizer)
+            gpt_input = {name: value.to(device) for name, value in gpt_input.items()}
+            x, y = x.to(device), y.to(device)
             with torch.inference_mode():
                 teacher_output = teacher(**gpt_input)
                 teacher_logits = extract_source_logits(
-                    gpt_input.input_ids,
                     teacher_output.logits,
-                    teacher_source,
-                ).to(student_device)
+                    source_start,
+                    x.size(1),
+                ).to(device)
 
             predicted_logits, _ = student(x, y)
             loss = criterion(predicted_logits, teacher_logits, y)
@@ -279,7 +241,7 @@ def distill(epochs, text):
                         "step": steps,
                         "loss": total_loss / steps,
                     },
-                    f"/checkpoints/{global_config['checkpoint_name']}",
+                    f"/checkpoints/{checkpoint_name}",
                 )
                 checkpoint_volume.commit()
 
@@ -298,18 +260,18 @@ def distill(epochs, text):
                     "epoch": epoch,
                     "loss": epoch_loss,
                 },
-                f"/checkpoints/{global_config['checkpoint_name']}",
+                f"/checkpoints/{checkpoint_name}",
             )
             checkpoint_volume.commit()
             global_loss = epoch_loss
 
 
-def sample_sprawl(model, length, tokenizer):
+def sample_sprawl(
+    model, length, tokenizer, input_text="He was now inside the matrix, the grid,"
+):
     model.eval()
 
-    tokens = torch.tensor(
-        tokenizer.encode("He was now inside the matrix, the grid,"), dtype=torch.long
-    )
+    tokens = torch.tensor(tokenizer.encode(input_text), dtype=torch.long)
     tokens = tokens.unsqueeze(0).to(next(model.parameters()).device)
 
     while tokens.size(1) < length:
@@ -330,38 +292,24 @@ def sample_sprawl(model, length, tokenizer):
 
 
 @app.local_entrypoint()
-def main(print_params=False, corpus: Literal["sprawl", "corpus"] = "corpus"):
+def main(
+    checkpoint_name: str,
+    wandb_run_name: str,
+    wandb_entity_name: str,
+    print_params: bool = False,
+    corpus: Literal["sprawl", "corpus"] = "corpus",
+    epochs: int = 5,
+):
 
     if print_params:
-        global_config = {
-            "checkpoint_name": "neuromancer-distilled-256.pth",
-            "lightweight": {
-                "block_size": 256,
-                "vocab_size": 201088,
-                "n_layer": 4,
-                "n_head": 2,
-                "n_embd": 64,
-            },
-        }
-
-        @dataclass
-        class GPTConfig:
-            block_size: int = global_config["lightweight"][
-                "block_size"
-            ]  # max sequence length
-            vocab_size: int = global_config["lightweight"][
-                "vocab_size"
-            ]  # number of tokens in vocabulary
-            n_layer: int = global_config["lightweight"][
-                "n_layer"
-            ]  # number of transformer blocks
-            n_head: int = global_config["lightweight"][
-                "n_head"
-            ]  # number of attention heads
-            n_embd: int = global_config["lightweight"]["n_embd"]  # embedding dimension
-
         config = GPTConfig()
         model = GPT(config)
         model.print_num_parameters()
     else:
-        distill.remote(5, corpus)
+        distill.remote(
+            epochs,
+            corpus,
+            checkpoint_name,
+            wandb_run_name,
+            wandb_entity_name,
+        )

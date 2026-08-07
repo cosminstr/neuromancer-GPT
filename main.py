@@ -1,17 +1,17 @@
 import math
+from dataclasses import dataclass
+from typing import Literal
+
 import modal
-from tqdm import tqdm
 import torch
 import torch.nn as nn
-from dataclasses import dataclass
-from torch.utils.data import Dataset, DataLoader
-from typing import Literal
 import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset
+from tqdm import tqdm
 
-from utils import generate_vocab, encode, decode
+from utils import decode, encode, generate_vocab
 
 global_config = {
-    "checkpoint_name": "neuromancer-lightweight-128.pth",
     "gpt-2": {  # this was trained on the original sprawl-only corpus.
         "block_size": 128,
         "vocab_size": 18413,  # 25497 for corpus.txt
@@ -182,7 +182,7 @@ checkpoint_volume = modal.Volume.from_name("gpt-neuromancer", create_if_missing=
     timeout=60 * 60 * 24,
     volumes={"/checkpoints": checkpoint_volume},
 )
-def train(epochs, corpus):
+def train(epochs, corpus, checkpoint_name):
     torch.manual_seed(42)
     device = torch.device("cuda")
     print(f"Working on {device}")
@@ -240,7 +240,7 @@ def train(epochs, corpus):
                     "epoch": epoch,
                     "loss": epoch_loss,
                 },
-                f"/checkpoints/{global_config['checkpoint_name']}",
+                f"/checkpoints/{checkpoint_name}",
             )
             checkpoint_volume.commit()
             global_loss = epoch_loss
@@ -288,7 +288,12 @@ def sample_sprawl(model, length, stoi, itos):
 
 
 @app.local_entrypoint()
-def main(print_params=False, corpus: Literal["sprawl", "corpus"] = "corpus"):
+def main(
+    checkpoint_name: str,
+    print_params: bool = False,
+    corpus: Literal["sprawl", "corpus"] = "corpus",
+    epochs: int = 5,
+):
     if print_params:
         with open(f"{corpus}.txt", "r") as f:
             sprawl = f.read()
@@ -298,4 +303,4 @@ def main(print_params=False, corpus: Literal["sprawl", "corpus"] = "corpus"):
         model = GPT(config)
         model.print_num_parameters()
     else:
-        train.remote(5, corpus)
+        train.remote(epochs, corpus, checkpoint_name)

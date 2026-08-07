@@ -1,9 +1,9 @@
 import os
-from dotenv import load_dotenv
-from typing import Optional
 from pathlib import Path
+from typing import Optional
 
 import modal
+from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).parent / ".env")
 
