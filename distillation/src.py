@@ -174,10 +174,6 @@ def distill(epochs, text, checkpoint_name, wandb_run_name, wandb_entity_name):
     )
     teacher.eval()
 
-    wandb_run = wandb.init(
-        entity=wandb_entity_name, project="neuromancer-GPT", name=wandb_run_name
-    )
-
     print(f"Teacher on {device}; student on {device}")
 
     with open(f"/root/{text}.txt") as f:
@@ -187,9 +183,9 @@ def distill(epochs, text, checkpoint_name, wandb_run_name, wandb_entity_name):
     loader = DataLoader(dataset, batch_size=32, shuffle=True)
 
     config = GPTConfig(vocab_size=teacher.get_output_embeddings().out_features)
-    student = GPT(config).to(device)
-    base_lr = 3e-4
-    optimizer = torch.optim.AdamW(student.parameters(), lr=base_lr)
+    checkpoint = torch.load(f"/checkpoints/{checkpoint_name}")
+
+    base_lr = 2.1e-4
     criterion = DistillationLoss()
     total_steps = epochs * len(loader)
     warmup_steps = max(1, int(0.05 * total_steps))
@@ -201,7 +197,29 @@ def distill(epochs, text, checkpoint_name, wandb_run_name, wandb_entity_name):
         decay_progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
         return 0.5 * (1.0 + math.cos(math.pi * decay_progress))
 
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_schedule)
+    if checkpoint:  # continue a run
+        config = GPTConfig(**checkpoint["config"])
+        student = GPT(config).to(device)
+        student.load_state_dict(checkpoint["model_state_dict"])
+
+        optimizer = torch.optim.AdamW(student.parameters(), lr=base_lr)
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_schedule)
+
+        scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+
+        print("Loaded pre-saved model for further distillation")
+        print(
+            f"Loaded:\nConfig: {checkpoint['config']}\nEpoch: {checkpoint['epoch']}\nLoss: {checkpoint['loss']}\nlr:{optimizer.param_groups[0]['lr']:.2e}"
+        )
+    else:
+        student = GPT(config).to(device)
+        optimizer = torch.optim.AdamW(student.parameters(), lr=base_lr)
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_schedule)
+
+    wandb_run = wandb.init(
+        entity=wandb_entity_name, project="neuromancer-GPT", name=wandb_run_name
+    )
 
     global_loss = float("inf")
     for epoch in range(epochs):
@@ -237,8 +255,10 @@ def distill(epochs, text, checkpoint_name, wandb_run_name, wandb_entity_name):
                     {
                         "model_state_dict": student.state_dict(),
                         "config": config.__dict__,
+                        "optimizer_state_dict": optimizer.state_dict(),
+                        "scheduler_state_dict": scheduler.state_dict(),
                         "epoch": epoch,
-                        "step": steps,
+                        "step": steps,  # total steps in current epoch (round to multiples of 1k)
                         "loss": total_loss / steps,
                     },
                     f"/checkpoints/{checkpoint_name}",
@@ -257,8 +277,11 @@ def distill(epochs, text, checkpoint_name, wandb_run_name, wandb_entity_name):
                 {
                     "model_state_dict": student.state_dict(),
                     "config": config.__dict__,
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "scheduler_state_dict": scheduler.state_dict(),
                     "epoch": epoch,
-                    "loss": epoch_loss,
+                    "step": steps,
+                    "loss": total_loss / steps,
                 },
                 f"/checkpoints/{checkpoint_name}",
             )
