@@ -10,15 +10,21 @@ I trained the model on [Modal](https://modal.com/).
 
 ## Usage
 
+Add your W&B API key to a `.env` file in the project root before running training:
+
+```dotenv
+WANDB_API_KEY=<your_wandb_api_key>
+```
+
 ```bash
 # Train and run the base model
-uv run modal run main.py --checkpoint-name <your_checkpoint_name> --epochs 5
+uv run modal run main.py --checkpoint-name <your_checkpoint_name> --wandb-run-name <your_wandb_run> --wandb-entity-name <your_wandb_entity> --epochs 5
 uv run modal run inference.py --checkpoint-name <your_checkpoint_name>
-
-# Train and run the distilled model
-uv run modal run distillation/src.py --checkpoint-name <your_checkpoint_name> --wandb-run-name <your_wandb_run> --wandb-entity-name <your_wandb_entity> --epochs 5
-uv run modal run distillation/inference.py --checkpoint-name <your_checkpoint_name>
 ```
+
+## Checkpoints
+
+To restart training, run the same command again with the same `--checkpoint-name`. If that checkpoint exists, training restores its model, optimizer, and scheduler states before starting the requested additional epochs. Use a new checkpoint name to start from scratch.
 
 Here is a 100 token paragraph the model generated.
 

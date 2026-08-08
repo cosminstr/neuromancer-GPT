@@ -1,15 +1,21 @@
 import math
+import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Literal
 
+from dotenv import load_dotenv
 import modal
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
+import wandb
 
 from utils import decode, encode, generate_vocab
+
+load_dotenv(Path(__file__).parent / ".env")
 
 global_config = {
     "gpt-2": {  # this was trained on the original sprawl-only corpus.
@@ -168,9 +174,10 @@ class GPT(nn.Module):
 app = modal.App("gpt-neuromancer")
 image = (
     modal.Image.debian_slim()
-    .pip_install("torch", "tqdm")
+    .pip_install("torch", "tqdm", "wandb", "python-dotenv")
     .add_local_file("corpus.txt", "/root/corpus.txt", copy=True)
     .add_local_file("sprawl.txt", "/root/sprawl.txt", copy=True)
+    .env({"WANDB_API_KEY": os.environ["WANDB_API_KEY"]})
     .add_local_python_source("utils")
 )
 checkpoint_volume = modal.Volume.from_name("gpt-neuromancer", create_if_missing=True)
@@ -182,7 +189,7 @@ checkpoint_volume = modal.Volume.from_name("gpt-neuromancer", create_if_missing=
     timeout=60 * 60 * 24,
     volumes={"/checkpoints": checkpoint_volume},
 )
-def train(epochs, corpus, checkpoint_name):
+def train(epochs, corpus, checkpoint_name, wandb_run_name, wandb_entity_name):
     torch.manual_seed(42)
     device = torch.device("cuda")
     print(f"Working on {device}")
@@ -195,9 +202,12 @@ def train(epochs, corpus, checkpoint_name):
     loader = DataLoader(dataset, batch_size=64, shuffle=True)
 
     config = GPTConfig(vocab_size=len(stoi))
-    model = GPT(config).to(device)
+    checkpoint_path = f"/checkpoints/{checkpoint_name}"
+    checkpoint = (
+        torch.load(checkpoint_path) if os.path.exists(checkpoint_path) else None
+    )
+
     base_lr = 3e-4
-    optimizer = torch.optim.AdamW(model.parameters(), lr=base_lr)
     total_steps = epochs * len(loader)
     warmup_steps = max(1, int(0.05 * total_steps))
 
@@ -208,13 +218,37 @@ def train(epochs, corpus, checkpoint_name):
         decay_progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
         return 0.5 * (1.0 + math.cos(math.pi * decay_progress))
 
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_schedule)
+    if checkpoint:  # continue a run
+        config = GPTConfig(**checkpoint["config"])
+        model = GPT(config).to(device)
+        model.load_state_dict(checkpoint["model_state_dict"])
+
+        optimizer = torch.optim.AdamW(model.parameters(), lr=base_lr)
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_schedule)
+
+        scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+
+        print("Loaded pre-saved model for further training")
+        print(
+            f"Loaded:\nConfig: {checkpoint['config']}\nEpoch: {checkpoint['epoch']}\nLoss: {checkpoint['loss']}\nlr:{optimizer.param_groups[0]['lr']:.2e}"
+        )
+    else:
+        model = GPT(config).to(device)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=base_lr)
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_schedule)
+
+    wandb_run = wandb.init(
+        entity=wandb_entity_name, project="neuromancer-GPT", name=wandb_run_name
+    )
 
     global_loss = float("inf")
     for epoch in range(epochs):
         model.train()
         total_loss = 0
+        steps = 0
         for x, y in tqdm(loader):
+            steps += 1
             optimizer.zero_grad()
             x, y = x.to(device), y.to(device)
 
@@ -224,6 +258,27 @@ def train(epochs, corpus, checkpoint_name):
             loss.backward()
             optimizer.step()
             scheduler.step()
+
+            if steps % 1000 == 0:
+                sample_sprawl(model, 100, stoi, itos)
+
+                torch.save(
+                    {
+                        "model_state_dict": model.state_dict(),
+                        "config": config.__dict__,
+                        "optimizer_state_dict": optimizer.state_dict(),
+                        "scheduler_state_dict": scheduler.state_dict(),
+                        "stoi": stoi,
+                        "itos": itos,
+                        "epoch": epoch,
+                        "step": steps,
+                        "loss": total_loss / steps,
+                    },
+                    checkpoint_path,
+                )
+                checkpoint_volume.commit()
+
+            wandb_run.log({"loss": total_loss / steps})
 
         epoch_loss = total_loss / len(loader)
         print(
@@ -235,12 +290,15 @@ def train(epochs, corpus, checkpoint_name):
                 {
                     "model_state_dict": model.state_dict(),
                     "config": config.__dict__,
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "scheduler_state_dict": scheduler.state_dict(),
                     "stoi": stoi,
                     "itos": itos,
                     "epoch": epoch,
-                    "loss": epoch_loss,
+                    "step": steps,
+                    "loss": total_loss / steps,
                 },
-                f"/checkpoints/{checkpoint_name}",
+                checkpoint_path,
             )
             checkpoint_volume.commit()
             global_loss = epoch_loss
@@ -290,6 +348,8 @@ def sample_sprawl(model, length, stoi, itos):
 @app.local_entrypoint()
 def main(
     checkpoint_name: str,
+    wandb_run_name: str,
+    wandb_entity_name: str,
     print_params: bool = False,
     corpus: Literal["sprawl", "corpus"] = "corpus",
     epochs: int = 5,
@@ -303,4 +363,10 @@ def main(
         model = GPT(config)
         model.print_num_parameters()
     else:
-        train.remote(epochs, corpus, checkpoint_name)
+        train.remote(
+            epochs,
+            corpus,
+            checkpoint_name,
+            wandb_run_name,
+            wandb_entity_name,
+        )

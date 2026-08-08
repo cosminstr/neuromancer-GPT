@@ -183,7 +183,10 @@ def distill(epochs, text, checkpoint_name, wandb_run_name, wandb_entity_name):
     loader = DataLoader(dataset, batch_size=32, shuffle=True)
 
     config = GPTConfig(vocab_size=teacher.get_output_embeddings().out_features)
-    checkpoint = torch.load(f"/checkpoints/{checkpoint_name}")
+    checkpoint_path = f"/checkpoints/{checkpoint_name}"
+    checkpoint = (
+        torch.load(checkpoint_path) if os.path.exists(checkpoint_path) else None
+    )
 
     base_lr = 2.1e-4
     criterion = DistillationLoss()
