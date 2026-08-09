@@ -1,3 +1,7 @@
+import os
+from pathlib import Path
+from dotenv import load_dotenv
+
 import modal
 import torch
 
@@ -62,10 +66,13 @@ def sample_sprawl(model, length, stoi, itos):
 
 
 
+load_dotenv(Path(__file__).parent / ".env")
+
 app = modal.App("gpt-neuromancer-inference")
 image = (
     modal.Image.debian_slim()
-    .pip_install("torch", "tqdm")
+    .pip_install("torch", "tqdm", "wandb")
+    .env({"WANDB_API_KEY": os.environ["WANDB_API_KEY"]})
     .add_local_python_source("main")
     .add_local_python_source("utils")
 )

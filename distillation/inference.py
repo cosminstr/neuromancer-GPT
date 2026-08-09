@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 from dataclasses import dataclass
 
 from dotenv import load_dotenv
@@ -9,7 +10,7 @@ from transformers import AutoTokenizer
 
 from main import GPT
 
-load_dotenv()
+load_dotenv(Path(__file__).parent / ".env")
 
 
 @dataclass
@@ -33,7 +34,9 @@ def sample_sprawl(
 
     while tokens.size(1) < length:
         with torch.no_grad():
-            tokens_id = tokens if tokens.size(1) <= context_size else tokens[:, -context_size:] 
+            tokens_id = (
+                tokens if tokens.size(1) <= context_size else tokens[:, -context_size:]
+            )
             logits, _ = model(tokens_id)
             logits = logits[:, -1, :]
             probs = F.softmax(logits, dim=-1)
