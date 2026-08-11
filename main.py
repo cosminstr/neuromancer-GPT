@@ -23,8 +23,8 @@ global_config = {
         "vocab_size": 18413,  # 25497 for corpus.txt
         "n_layer": 12,
         "n_head": 12,
-        "n_embd": 768,
-    },
+        "n_embd": 768, 
+},
     "lightweight": {
         "block_size": 256,
         "vocab_size": 25497,
@@ -88,11 +88,11 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
 
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))  # 6
-        att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))  # 7
+        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))  
+        att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))  
         att = F.softmax(att, dim=-1)
-        y = att @ v  # 8
-        y = y.transpose(1, 2).contiguous().view(B, T, C)  # 9
+        y = att @ v  
+        y = y.transpose(1, 2).contiguous().view(B, T, C)  
         y = self.c_proj(y)
         return y
 
@@ -110,6 +110,23 @@ class MLP(nn.Module):
         x = self.c_proj(x)
         return x
 
+class swiGLU(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        dim = config.n_embd
+        # scale dimension to 2/3 of what the basic MLP had
+        # as per https://arxiv.org/pdf/2002.05202
+        self.w1 = nn.Linear(dim, (2 * 4 * dim) / 3, bias=False)
+        self.w2 = nn.Linear((2 * 4 * dim) / 3, (2 * 4 * dim) / 3, bias=False)
+        self.w3 = nn.Linear((2 * 4 * dim) / 3, dim, bias=False)
+        self.silu = nn.SiLU()
+
+    def forward(self, x):
+        output = self.w2(x) * self.silu(self.w1(x)) # element wise multiplication (gating)
+
+        return self.w3(output)
+
+
 
 class TransformerBlock(nn.Module):
     def __init__(self, config):
@@ -117,7 +134,7 @@ class TransformerBlock(nn.Module):
         self.ln_1 = nn.LayerNorm(config.n_embd)
         self.attn = CausalSelfAttention(config)
         self.ln_2 = nn.LayerNorm(config.n_embd)
-        self.mlp = MLP(config)
+        self.mlp = swiGLU(config)
 
     def forward(self, x):
         x = x + self.attn(self.ln_1(x))
