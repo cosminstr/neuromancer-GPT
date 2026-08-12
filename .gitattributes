@@ -1,1 +1,2 @@
 checkpoints/neuromancer-gpt-*.pth filter=lfs diff=lfs merge=lfs -text
+distillation/checkpoints/neuromancer-distilled-*.pth filter=lfs diff=lfs merge=lfs -text
